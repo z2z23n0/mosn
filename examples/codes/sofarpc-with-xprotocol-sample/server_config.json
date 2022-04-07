@@ -28,10 +28,9 @@
 							{
 								"type": "proxy",
 								"config": {
-									"downstream_protocol": "X",
-									"upstream_protocol": "X",
+									"downstream_protocol": "bolt",
 									"extend_config": {
-										"sub_protocol": "bolt"
+										"enable_bolt_go_away": true
 									},
 									"router_config_name":"server_router"
 								}

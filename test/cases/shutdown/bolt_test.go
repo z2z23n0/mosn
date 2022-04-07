@@ -14,6 +14,7 @@ import (
 	"mosn.io/api"
 	"mosn.io/pkg/buffer"
 
+	"mosn.io/mosn/pkg/log"
 	"mosn.io/mosn/pkg/network"
 	"mosn.io/mosn/pkg/protocol"
 	"mosn.io/mosn/pkg/protocol/xprotocol"
@@ -24,6 +25,7 @@ import (
 	xtrace "mosn.io/mosn/pkg/trace/sofa/xprotocol"
 	"mosn.io/mosn/pkg/types"
 	. "mosn.io/mosn/test/framework"
+	"mosn.io/mosn/test/lib/mosn"
 )
 
 type BoltClient struct {
@@ -55,15 +57,17 @@ func (c *BoltClient) OnReceive(ctx context.Context, headers types.HeaderMap, dat
 	if cmd, ok := headers.(api.XFrame); ok {
 		streamID := protocol.StreamIDConv(cmd.GetRequestId())
 
+		if predicate, ok := cmd.(api.GoAwayPredicate); ok {
+			if predicate.IsGoAwayFrame() {
+				log.DefaultLogger.Infof("got goaway frame, stream:", streamID)
+				c.goaway = true
+			}
+		}
 		if resp, ok := cmd.(api.XRespFrame); ok {
 			fmt.Println("stream:", streamID, " status:", resp.GetStatusCode())
 		} else {
 			fmt.Println("resp is not api.XRespFrame")
 			return
-		}
-		if predicate, ok := headers.(api.GoAwayPredicate); ok && predicate.IsGoAwayFrame() {
-			fmt.Println("stream:", streamID, " goaway")
-			c.goaway = true
 		}
 	}
 }
@@ -93,6 +97,8 @@ type BoltServer struct {
 	protocolName api.ProtocolName
 	protocol     api.XProtocol
 	connected    int
+	closed       int
+	Mode         int
 }
 
 func NewBoltServer(addr string, proto api.XProtocol) *BoltServer {
@@ -130,6 +136,10 @@ func (s *BoltServer) Run() {
 
 func (s *BoltServer) Serve(conn net.Conn) {
 	iobuf := buffer.NewIoBuffer(102400)
+	defer func() {
+		s.closed++
+		conn.Close()
+	}()
 	for {
 		now := time.Now()
 		conn.SetReadDeadline(now.Add(30 * time.Second))
@@ -139,15 +149,18 @@ func (s *BoltServer) Serve(conn net.Conn) {
 			if err, ok := err.(net.Error); ok && err.Timeout() {
 				fmt.Printf("[Xprotocol RPC BoltServer] Connect read error: %v\n", err)
 				continue
+			} else {
+				fmt.Printf("[Xprotocol RPC BoltServer] Connect read error: %v\n", err)
+				return
 			}
 
 		}
-		//if mode == GoAwayBeforeResponse {
-		//	if err := sendBoltGoAway(conn); err != nil {
-		//		fmt.printf("[Xprotocol RPC BoltServer] send goaway error: %v\n", err)
-		//		return
-		//	}
-		//}
+		if s.Mode == GoAwayBeforeResponse {
+			if err := sendBoltGoAway(conn); err != nil {
+				fmt.Printf("[Xprotocol RPC BoltServer] send goaway error: %v\n", err)
+				return
+			}
+		}
 		if bytesRead > 0 {
 			iobuf.Write(buf[:bytesRead])
 			for iobuf.Len() > 1 {
@@ -168,19 +181,20 @@ func (s *BoltServer) Serve(conn net.Conn) {
 					return
 				}
 
-				//// sleep 500 ms
-				//time.Sleep(time.Millisecond * 500)
+				// sleep 500 ms
+				time.Sleep(time.Millisecond * 500)
 
 				conn.Write(respData.Bytes())
 
-				//if mode == GoAwayAfterResponse {
-				//	// sleep a while to wait the previous request finished in the mosn side.
-				//	time.Sleep(time.Millisecond * 10)
-				//
-				//	if err := sendGoAway(c); err != nil {
-				//		return
-				//	}
-				//}
+				if s.Mode == GoAwayAfterResponse {
+					// sleep a while to wait the previous request finished in the mosn side.
+					time.Sleep(time.Millisecond * 10)
+
+					if err := sendBoltGoAway(conn); err != nil {
+						fmt.Printf("[Xprotocol RPC BoltServer] send goaway error: %v\n", err)
+						return
+					}
+				}
 			}
 		}
 	}
@@ -193,11 +207,11 @@ func (s *BoltServer) HandleRequest(conn net.Conn, cmd interface{}) (api.XRespFra
 			switch req.CmdCode {
 			case bolt.CmdCodeHeartbeat:
 				hbAck := s.protocol.Reply(context.TODO(), req)
-				fmt.Printf("[Xprotocol RPC BoltServer] reponse bolt heartbeat, connection: %s, requestId: %d\n", conn.RemoteAddr().String(), req.GetRequestId())
+				fmt.Printf("[Xprotocol RPC BoltServer] response bolt heartbeat, connection: %s, requestId: %d\n", conn.RemoteAddr().String(), req.GetRequestId())
 				return hbAck, nil
 			case bolt.CmdCodeRpcRequest:
 				resp := bolt.NewRpcResponse(req.RequestId, bolt.ResponseStatusSuccess, nil, nil)
-				fmt.Printf("[Xprotocol RPC BoltServer] reponse bolt request, connection: %s, requestId: %d\n", conn.RemoteAddr().String(), req.GetRequestId())
+				fmt.Printf("[Xprotocol RPC BoltServer] response bolt request, connection: %s, requestId: %d\n", conn.RemoteAddr().String(), req.GetRequestId())
 				return resp, nil
 			}
 		}
@@ -229,6 +243,7 @@ func sendBoltGoAway(c net.Conn) error {
 	if _, err := c.Write(buf); err != nil {
 		return err
 	}
+	fmt.Println("[Xprotocol RPC BoltServer] GoAway has been sent")
 	return nil
 }
 func stopBoltServer(s *BoltServer) {
@@ -275,6 +290,9 @@ func TestBoltClientAndServer(t *testing.T) {
 				Verify(server.connected, Equal, 1)
 			}
 		})
+		TearDown(func() {
+			stopBoltServer(server)
+		})
 	})
 
 }
@@ -287,6 +305,7 @@ func TestBoltGracefulStop(t *testing.T) {
 		if server == nil {
 			t.Fatalf("create bolt server failed")
 		}
+		server.Mode = NoGoAway
 		Setup(func() {
 			// start server
 			go server.Run()
@@ -304,7 +323,7 @@ func TestBoltGracefulStop(t *testing.T) {
 
 			m = mosn.StartMosn(ConfigSimpleBoltExample)
 			Verify(m, NotNil)
-			time.Sleep(2 * time.Second) // wait mosn start
+			time.Sleep(15 * time.Second) // wait mosn start
 		})
 		Case("client-mosn-server", func() {
 			testcases := []struct {
@@ -318,7 +337,7 @@ func TestBoltGracefulStop(t *testing.T) {
 			}
 
 			for _, tc := range testcases {
-				client := NewBoltClient("127.0.0.1:2049", bolt.ProtocolName)
+				client := NewBoltClient("127.0.0.1:2046", bolt.ProtocolName)
 				if client == nil {
 					t.Fatalf("create bolt client failed")
 				}
@@ -327,6 +346,7 @@ func TestBoltGracefulStop(t *testing.T) {
 				start = time.Now()
 				client.Request(tc.reqHeader)
 				log.DefaultLogger.Infof("request cost %v", time.Since(start))
+				time.Sleep(3 * time.Second) // wait request
 				//Verify(err, Equal, nil)
 				//Verify(resp, Equal, tc.reqHeader)
 				Verify(client.goaway, Equal, false)
@@ -334,13 +354,15 @@ func TestBoltGracefulStop(t *testing.T) {
 
 				// 2. graceful stop after send request and before received the response
 				go func() {
-					time.Sleep(time.Millisecond * 100)
+					time.Sleep(time.Millisecond * 10)
 					m.GracefulStop()
 				}()
+				time.Sleep(10 * time.Millisecond) // wait mosn stop
 				start = time.Now()
 				//resp, err = boltRequest(client, tc.reqHeader)
 				client.Request(tc.reqHeader)
 				log.DefaultLogger.Infof("request cost %v", time.Since(start))
+				time.Sleep(3 * time.Second) // wait request
 				//Verify(err, Equal, nil)
 				//Verify(resp, Equal, tc.reqHeader)
 				Verify(client.goaway, Equal, true)
@@ -354,139 +376,167 @@ func TestBoltGracefulStop(t *testing.T) {
 	})
 }
 
-//// client(mosn) got away frame before get response
-//func TestBoltServerGoAwayBeforeResponse(t *testing.T) {
-//	Scenario(t, "bolt server goaway", func() {
-//		var m *mosn.MosnOperator
-//		server := &BoltServer{
-//			mode: GoAwayBeforeResponse,
-//		}
-//		Setup(func() {
-//			go startBoltServer(server)
-//
-//			m = mosn.StartMosn(ConfigSimpleBoltExample)
-//			Verify(m, NotNil)
-//			time.Sleep(2 * time.Second) // wait mosn start
-//		})
-//		Case("client-mosn-server", func() {
-//			testcases := []struct {
-//				reqBody string
-//			}{
-//				{
-//					reqBody: "test-req-body",
-//				},
-//			}
-//
-//			for _, tc := range testcases {
-//				conn, err := net.Dial("tcp", "127.0.0.1:2046")
-//				if err != nil {
-//					log.DefaultLogger.Errorf("connect to mosn failed: %v", err)
-//				}
-//				defer conn.Close()
-//				client := &BoltClient{
-//					conn: conn,
-//				}
-//				// 1. simple
-//				var start time.Time
-//				start = time.Now()
-//				resp, err := boltRequest(client, tc.reqBody)
-//				log.DefaultLogger.Infof("request cost %v", time.Since(start))
-//				Verify(err, Equal, nil)
-//				Verify(resp, Equal, tc.reqBody)
-//				Verify(client.goaway, Equal, false)
-//				Verify(server.connected, Equal, 1)
-//
-//				// sleep a while
-//				time.Sleep(time.Millisecond * 10)
-//				Verify(server.closed, Equal, 1)
-//
-//				// 2. try again
-//				start = time.Now()
-//				resp, err = boltRequest(client, tc.reqBody)
-//				log.DefaultLogger.Infof("request cost %v", time.Since(start))
-//				Verify(err, Equal, nil)
-//				Verify(resp, Equal, tc.reqBody)
-//				Verify(client.goaway, Equal, false)
-//				Verify(server.connected, Equal, 2)
-//
-//				// sleep a while
-//				time.Sleep(time.Millisecond * 10)
-//				Verify(server.closed, Equal, 2)
-//			}
-//		})
-//		TearDown(func() {
-//			stopBoltServer(server)
-//			m.Stop()
-//		})
-//	})
-//}
-//
-//// client(mosn) got away frame after get response
-//func TestBoltServerGoAwayAfterResponse(t *testing.T) {
-//	Scenario(t, "bolt server goaway", func() {
-//		var m *mosn.MosnOperator
-//		server := &BoltServer{
-//			mode: GoAwayAfterResponse,
-//		}
-//		Setup(func() {
-//			go startBoltServer(server)
-//
-//			m = mosn.StartMosn(ConfigSimpleBoltExample)
-//			Verify(m, NotNil)
-//			time.Sleep(2 * time.Second) // wait mosn start
-//		})
-//		Case("client-mosn-server", func() {
-//			testcases := []struct {
-//				reqBody string
-//			}{
-//				{
-//					reqBody: "test-req-body",
-//				},
-//			}
-//
-//			for _, tc := range testcases {
-//				conn, err := net.Dial("tcp", "127.0.0.1:2046")
-//				if err != nil {
-//					log.DefaultLogger.Errorf("connect to mosn failed: %v", err)
-//				}
-//				defer conn.Close()
-//				client := &BoltClient{
-//					conn: conn,
-//				}
-//				// 1. simple
-//				var start time.Time
-//				start = time.Now()
-//				resp, err := boltRequest(client, tc.reqBody)
-//				log.DefaultLogger.Infof("request cost %v", time.Since(start))
-//				Verify(err, Equal, nil)
-//				Verify(resp, Equal, tc.reqBody)
-//				Verify(client.goaway, Equal, false)
-//				Verify(server.connected, Equal, 1)
-//
-//				// sleep a while
-//				time.Sleep(time.Millisecond * 100)
-//				Verify(server.closed, Equal, 1)
-//
-//				// 2. try again
-//				start = time.Now()
-//				resp, err = boltRequest(client, tc.reqBody)
-//				log.DefaultLogger.Infof("request cost %v", time.Since(start))
-//				Verify(err, Equal, nil)
-//				Verify(resp, Equal, tc.reqBody)
-//				Verify(client.goaway, Equal, false)
-//				Verify(server.connected, Equal, 2)
-//
-//				// sleep a while
-//				time.Sleep(time.Millisecond * 100)
-//				Verify(server.closed, Equal, 2)
-//			}
-//		})
-//		TearDown(func() {
-//			stopBoltServer(server)
-//			m.Stop()
-//		})
-//	})
-//}
+// client(mosn) got away frame before get response
+func TestBoltServerGoAwayBeforeResponse(t *testing.T) {
+	Scenario(t, "bolt server goaway", func() {
+		var m *mosn.MosnOperator
+		server := NewBoltServer("127.0.0.1:8080", (&bolt.XCodec{}).NewXProtocol(context.Background()))
+		if server == nil {
+			t.Fatalf("create bolt server failed")
+		}
+		server.Mode = GoAwayBeforeResponse
+		Setup(func() {
+			// start server
+			go server.Run()
+
+			// register bolt
+			// tracer driver register
+			trace.RegisterDriver("SOFATracer", trace.NewDefaultDriverImpl())
+			// xprotocol action register
+			xprotocol.ResgisterXProtocolAction(xstream.NewConnPool, xstream.NewStreamFactory, func(codec api.XProtocolCodec) {
+				name := codec.ProtocolName()
+				trace.RegisterTracerBuilder("SOFATracer", name, xtrace.NewTracer)
+			})
+			// xprotocol register
+			_ = xprotocol.RegisterXProtocolCodec(&bolt.XCodec{})
+
+			m = mosn.StartMosn(ConfigSimpleBoltExample)
+			Verify(m, NotNil)
+			time.Sleep(5 * time.Second) // wait mosn start
+		})
+		Case("client-mosn-server", func() {
+			testcases := []struct {
+				reqHeader map[string]string
+			}{
+				{
+					reqHeader: map[string]string{
+						"test-key": "test-value",
+					},
+				},
+			}
+
+			for _, tc := range testcases {
+				client := NewBoltClient("127.0.0.1:2046", bolt.ProtocolName)
+				if client == nil {
+					t.Fatalf("create bolt client failed")
+				}
+				// 1. simple
+				var start time.Time
+				start = time.Now()
+				client.Request(tc.reqHeader)
+				log.DefaultLogger.Infof("request cost %v", time.Since(start))
+				time.Sleep(3 * time.Second) // wait request
+				//Verify(err, Equal, nil)
+				//Verify(resp, Equal, tc.reqBody)
+				Verify(client.goaway, Equal, false)
+				Verify(server.connected, Equal, 1)
+
+				// sleep a while
+				time.Sleep(time.Millisecond * 10)
+				Verify(server.closed, Equal, 1)
+
+				// 2. try again
+				start = time.Now()
+				client.Request(tc.reqHeader)
+				log.DefaultLogger.Infof("request cost %v", time.Since(start))
+				time.Sleep(3 * time.Second) // wait request
+				//Verify(err, Equal, nil)
+				//Verify(resp, Equal, tc.reqBody)
+				Verify(client.goaway, Equal, false)
+				//Verify(server.connected, Equal, 2)
+
+				// sleep a while
+				time.Sleep(time.Millisecond * 10)
+				Verify(server.closed, Equal, 2)
+			}
+		})
+		TearDown(func() {
+			stopBoltServer(server)
+			m.Stop()
+		})
+	})
+}
+
+// client(mosn) got away frame after get response
+func TestBoltServerGoAwayAfterResponse(t *testing.T) {
+	Scenario(t, "bolt server goaway", func() {
+		var m *mosn.MosnOperator
+		server := NewBoltServer("127.0.0.1:8080", (&bolt.XCodec{}).NewXProtocol(context.Background()))
+		if server == nil {
+			t.Fatalf("create bolt server failed")
+		}
+		server.Mode = GoAwayAfterResponse
+		Setup(func() {
+			// start server
+			go server.Run()
+
+			// register bolt
+			// tracer driver register
+			trace.RegisterDriver("SOFATracer", trace.NewDefaultDriverImpl())
+			// xprotocol action register
+			xprotocol.ResgisterXProtocolAction(xstream.NewConnPool, xstream.NewStreamFactory, func(codec api.XProtocolCodec) {
+				name := codec.ProtocolName()
+				trace.RegisterTracerBuilder("SOFATracer", name, xtrace.NewTracer)
+			})
+			// xprotocol register
+			_ = xprotocol.RegisterXProtocolCodec(&bolt.XCodec{})
+
+			m = mosn.StartMosn(ConfigSimpleBoltExample)
+			Verify(m, NotNil)
+			time.Sleep(5 * time.Second) // wait mosn start
+		})
+		Case("client-mosn-server", func() {
+			testcases := []struct {
+				reqHeader map[string]string
+			}{
+				{
+					reqHeader: map[string]string{
+						"test-key": "test-value",
+					},
+				},
+			}
+
+			for _, tc := range testcases {
+				client := NewBoltClient("127.0.0.1:2046", bolt.ProtocolName)
+				if client == nil {
+					t.Fatalf("create bolt client failed")
+				}
+				// 1. simple
+				var start time.Time
+				start = time.Now()
+				client.Request(tc.reqHeader)
+				log.DefaultLogger.Infof("request cost %v", time.Since(start))
+				time.Sleep(3 * time.Second) // wait request
+				//Verify(err, Equal, nil)
+				//Verify(resp, Equal, tc.reqBody)
+				Verify(client.goaway, Equal, false)
+				Verify(server.connected, Equal, 1)
+
+				// sleep a while
+				time.Sleep(time.Millisecond * 100)
+				Verify(server.closed, Equal, 1)
+
+				// 2. try again
+				start = time.Now()
+				client.Request(tc.reqHeader)
+				log.DefaultLogger.Infof("request cost %v", time.Since(start))
+				time.Sleep(3 * time.Second) // wait request
+				//Verify(err, Equal, nil)
+				//Verify(resp, Equal, tc.reqBody)
+				Verify(client.goaway, Equal, false)
+				Verify(server.connected, Equal, 2)
+
+				// sleep a while
+				time.Sleep(time.Millisecond * 100)
+				Verify(server.closed, Equal, 2)
+			}
+		})
+		TearDown(func() {
+			stopBoltServer(server)
+			m.Stop()
+		})
+	})
+}
 
 const ConfigSimpleBoltExample = `{
     "servers": [
@@ -523,12 +573,10 @@ const ConfigSimpleBoltExample = `{
                                 {
                                     "type": "proxy",
                                     "config": {
-                                        "downstream_protocol": "X",
-										"upstream_protocol": "X",
+                                        "downstream_protocol": "bolt",
                                         "router_config_name": "router_to_server",
                                         "extend_config": {
-                                            "sub_protocol": "bolt",
-                                            "enable_bolt_go_away": "true"
+                                            "enable_bolt_go_away": true
                                         }
                                     }
                                 }
@@ -557,7 +605,7 @@ const ConfigSimpleBoltExample = `{
 		"address": {
 			"socket_address": {
 				"address": "0.0.0.0",
-				"port_value": 34902
+				"port_value": 34909
 			}
 		}
 	}

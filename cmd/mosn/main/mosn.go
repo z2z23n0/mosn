@@ -78,6 +78,7 @@ import (
 var Version = "0.26.0"
 
 func main() {
+	time.Sleep(10 * time.Second)
 	app := newMosnApp(&cmdStart)
 
 	// ignore error so we don't exit non-zero and break gfmrun README example tests
