@@ -96,9 +96,6 @@ func TestAccessLog(t *testing.T) {
 	if err != nil {
 		t.Errorf("read log file: %s, error: %v", logName, err)
 	}
-	if err != nil {
-		t.Errorf("test accesslog error")
-	}
 	t.Logf("%v", string(b))
 	ok, err := regexp.Match("\\d\\d\\d\\d/\\d\\d/\\d\\d .* .* .* 2048 2048 \\- 0 .* false 0 127.0.0.1:23456 \\[2001:db8::68\\]:12200 127.0.0.1:53242 \\-\n", b)
 
